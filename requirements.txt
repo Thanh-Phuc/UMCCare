@@ -5,3 +5,6 @@ plotly
 scipy
 statsmodels
 scikit-learn
+re 
+datetime
+openpyxl
