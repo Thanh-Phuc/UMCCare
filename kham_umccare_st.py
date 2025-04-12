@@ -5,6 +5,7 @@ import numpy as np
 import os
 from datetime import datetime, date # Import the date object
 import re
+import openpyxl
 
 # Set page configuration (do this ONLY in the main script)
 st.set_page_config(
@@ -37,15 +38,130 @@ def parse_sheet_name_to_date(sheet_name):
             continue
     # st.warning(f"Không thể tự động nhận dạng tháng/năm từ tên sheet: '{sheet_name}'. Bỏ qua sheet này.") # Reduce noise
     return None
-
 # --- Data Loading Function ---
-# ...(No changes needed in the core logic, just ensure it returns Timestamps or None)...
 @st.cache_data(ttl=3600)
-def load_process_umc_data_monthly(uploaded_file_obj):
+def load_process_umc_data_monthly(file_path):
     """Loads data assuming each sheet is a month, EXCLUDING 'Grand Total' specialty rows."""
     st.info("Đang đọc file Excel...")
     try:
-        df_sheets = pd.read_excel(uploaded_file_obj, sheet_name=None)
+        df_sheets = pd.read_excel(file_path, sheet_name=None)
+        if not df_sheets:
+            st.error("File Excel không chứa sheet nào.")
+            return None
+
+        all_monthly_data = []
+        valid_sheets_found = 0
+        parsed_sheet_names = [] # Keep track to avoid duplicate warnings
+
+        for sheet_name, raw_data in df_sheets.items():
+            month_date = parse_sheet_name_to_date(sheet_name)
+            if month_date is None:
+                if sheet_name not in parsed_sheet_names: # Show warning only once per name
+                    st.warning(f"Bỏ qua sheet '{sheet_name}' do không nhận dạng được ngày tháng.")
+                    parsed_sheet_names.append(sheet_name)
+                continue
+
+            if 'Chuyên khoa' not in raw_data.columns:
+                st.warning(f"Sheet '{sheet_name}' ({month_date.strftime('%b %Y')}) thiếu cột 'Chuyên khoa'. Bỏ qua.")
+                continue
+
+            # Exclude Grand Total / Summary Rows
+            raw_data['Chuyên khoa'] = raw_data['Chuyên khoa'].astype(str)
+            mask_keep = ~raw_data['Chuyên khoa'].str.lower().str.strip().isin(EXCLUDE_SPECIALTY_TERMS)
+            data_cleaned = raw_data[mask_keep].copy()
+            if data_cleaned.empty:
+                 st.warning(f"Sheet '{sheet_name}' ({month_date.strftime('%b %Y')}) không còn dữ liệu sau khi loại bỏ dòng tổng cộng. Bỏ qua.")
+                 continue
+
+            present_channels = [ch for ch in EXPECTED_CHANNELS if ch in data_cleaned.columns]
+
+            cols_to_keep = ['Chuyên khoa'] + present_channels
+            cols_to_keep = [col for col in cols_to_keep if col in data_cleaned.columns]
+            monthly_df = data_cleaned[cols_to_keep].copy()
+            monthly_df['Month'] = month_date
+
+            for channel in present_channels:
+                monthly_df[channel] = pd.to_numeric(monthly_df[channel], errors='coerce').fillna(0).astype(int)
+
+            if present_channels:
+                 monthly_df['Grand Total'] = monthly_df[present_channels].sum(axis=1)
+            else:
+                 monthly_df['Grand Total'] = 0
+
+            all_monthly_data.append(monthly_df)
+            valid_sheets_found += 1
+
+        if not all_monthly_data:
+            st.error("Không tìm thấy sheet hợp lệ nào chứa dữ liệu chuyên khoa (sau khi loại bỏ dòng tổng cộng).")
+            return None
+
+        combined_df = pd.concat(all_monthly_data, ignore_index=True)
+
+        pivot_values = [ch for ch in EXPECTED_CHANNELS if ch in combined_df.columns] + ['Grand Total']
+        pivot_values = list(set(col for col in pivot_values if col in combined_df.columns))
+
+        try:
+             duplicates = combined_df[combined_df.duplicated(subset=['Month', 'Chuyên khoa'], keep=False)]
+             if not duplicates.empty:
+                 st.warning("Phát hiện dữ liệu chuyên khoa trùng lặp trong cùng một tháng. Sẽ cộng gộp giá trị.")
+
+             pivoted_df = combined_df.pivot_table(
+                 index=['Month', 'Chuyên khoa'],
+                 values=pivot_values,
+                 fill_value=0,
+                 aggfunc='sum'
+             )
+        except Exception as pivot_error:
+             st.error(f"Lỗi khi tổng hợp dữ liệu: {pivot_error}")
+             return None
+
+        pivoted_df = pivoted_df.sort_index()
+
+        if 'Grand Total' in pivoted_df.columns:
+             pivoted_df['Total_Registrations_AllM'] = pivoted_df.groupby(level='Chuyên khoa')['Grand Total'].transform('sum')
+        else:
+             channel_sum_cols = [ch for ch in EXPECTED_CHANNELS if ch in pivoted_df.columns]
+             if channel_sum_cols:
+                  pivoted_df['Temp_Total'] = pivoted_df[channel_sum_cols].sum(axis=1)
+                  pivoted_df['Total_Registrations_AllM'] = pivoted_df.groupby(level='Chuyên khoa')['Temp_Total'].transform('sum')
+                  if 'Temp_Total' in pivoted_df.columns: del pivoted_df['Temp_Total']
+             else:
+                  pivoted_df['Total_Registrations_AllM'] = 0
+
+        st.success(f"Đã xử lý thành công dữ liệu từ {valid_sheets_found} sheet.")
+        return pivoted_df
+
+    except Exception as e:
+        st.error(f"Lỗi khi đọc hoặc xử lý file Excel: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+
+file_path = "So lieu UMC care.xlsx"
+# Load data directly from file_path if it exists
+if os.path.exists(file_path):
+    st.info(f"Đang tải dữ liệu từ file: {file_path}")
+    data = load_process_umc_data_monthly(file_path)
+    if data is not None:
+        st.session_state['umc_data'] = data
+        min_ts = data.index.get_level_values('Month').min()
+        max_ts = data.index.get_level_values('Month').max()
+        st.session_state['min_date'] = min_ts
+        st.session_state['max_date'] = max_ts
+        st.session_state['start_date'] = min_ts
+        st.session_state['end_date'] = max_ts
+    else:
+        st.error("Không thể tải dữ liệu từ file.")
+else:
+    st.warning(f"File '{file_path}' không tồn tại. Vui lòng kiểm tra đường dẫn.")
+# --- Data Loading Function ---
+# ...(No changes needed in the core logic, just ensure it returns Timestamps or None)...
+@st.cache_data(ttl=3600)
+def load_process_umc_data_monthly(file_path):
+    """Loads data assuming each sheet is a month, EXCLUDING 'Grand Total' specialty rows."""
+    st.info("Đang đọc file Excel...")
+    try:
+        df_sheets = pd.read_excel(file_path, sheet_name=None)
         if not df_sheets:
             st.error("File Excel không chứa sheet nào.")
             return None
